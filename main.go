@@ -5,53 +5,20 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"golang.org/x/time/rate"
 )
 
-// 令牌桶
-type TokenBucketLimiter struct {
-	tokens chan struct{}
-}
+//限流器
 
-func NewTokenBucketLimiter(maxTokens int, refillRate time.Duration) *TokenBucketLimiter {
-
-	limiter := &TokenBucketLimiter{
-		tokens: make(chan struct{}, maxTokens),
-	}
-
-	for i := 0; i < maxTokens; i++ {
-		limiter.tokens <- struct{}{}
-	}
-
-	go func() {
-		ticker := time.NewTicker(refillRate)
-		for range ticker.C {
-			select {
-			case limiter.tokens <- struct{}{}:
-			default:
-			}
-		}
-	}()
-	return limiter
-}
-
-func (tl *TokenBucketLimiter) Allow() bool {
-	select {
-	case <-tl.tokens:
-		return true
-	default:
-		return false
-	}
-}
-
-var globalLimiter = NewTokenBucketLimiter(3, 330*time.Millisecond)
+var globalLimiter = rate.NewLimiter(rate.Every(330*time.Millisecond), 3)
 
 func rateLimitMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !globalLimiter.Allow() {
-			// 没令牌了，直接拦截，返回 429 状态码
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusTooManyRequests)
-			w.Write([]byte(`{"error": "Too Many Requests", "message": "网关流量触发熔断，请稍后再试"}`))
+			w.Write([]byte(`{"error": "Too Many Requests", "message": "网关流量触发熔断，官方高精度限流器已拦截"}`))
 			return
 		}
 		next(w, r)
