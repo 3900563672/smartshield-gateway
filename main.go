@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"os"
 	"time"
 
 	"golang.org/x/time/rate"
@@ -20,6 +22,85 @@ type contextKey string
 
 const traceIDKey contextKey = "traceID"
 
+type DeepSeekMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+type DeepSeekResponseFormat struct {
+	Type string `json:"type"` // 用于强行约束大模型只返回纯 JSON 对象
+}
+
+type DeepSeekRequest struct {
+	Model          string                 `json:"model"`
+	Messages       []DeepSeekMessage      `json:"messages"`
+	ResponseFormat DeepSeekResponseFormat `json:"response_format"`
+}
+
+type DeepSeekResponse struct {
+	Choices []struct {
+		Message struct {
+			Content string `json:"content"`
+		} `json:"message"`
+	} `json:"choices"`
+}
+
+func healWithAI(ctx context.Context, errReason string, brokenBody []byte) ([]byte, error) {
+	apiKey := os.Getenv("DEEPSEEK_API_KEY")
+	if apiKey == "" {
+		return nil, fmt.Errorf("未检测到环境变量 DEEPSEEK_API_KEY，AI自愈引擎处于挂起状态")
+	}
+	systemPrompt := "你是一个高性能微服务网关的自愈代理。下游服务返回的 JSON 数据残缺，未通过 Schema 契约校验。请基于你的语义理解，帮我补充缺失的业务核心字段。你必须保证返回一个结构完整、完全合法的纯 JSON 对象，不要包含任何 markdown 标记（如 ```json）。"
+	userPrompt := fmt.Sprintf("【契约崩塌原因】: %s\n【残缺原始JSON】: %s\n请立刻修复并补齐缺失字段，输出对齐后的完美JSON：", errReason, string(brokenBody))
+
+	payload := DeepSeekRequest{
+		Model: "deepseek-chat",
+		Messages: []DeepSeekMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: userPrompt},
+		},
+		ResponseFormat: DeepSeekResponseFormat{Type: "json_object"}, // 强约束底层输出
+	}
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, "POST", "[https://api.deepseek.com/chat/completions](https://api.deepseek.com/chat/completions)", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBytes, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("大模型API响应异常，状态码: %d, 详情: %s", resp.StatusCode, string(respBytes))
+	}
+
+	var dsResp DeepSeekResponse
+	if err := json.Unmarshal(respBytes, &dsResp); err != nil {
+		return nil, err
+	}
+
+	if len(dsResp.Choices) == 0 {
+		return nil, fmt.Errorf("大模型未返回任何有效 Choices")
+	}
+
+	return []byte(dsResp.Choices[0].Message.Content), nil
+}
 func tryDeterministicHeal(statusCode int, bodyBytes []byte) ([]byte, bool) {
 	if statusCode == http.StatusOK && (len(bodyBytes) == 0 || string(bodyBytes) == "null") {
 		return []byte(`{}`), true
@@ -52,14 +133,11 @@ func checkSchemaContract(path string, bodyBytes []byte) error {
 		if _, hasOrigin := rawData["origin"]; !hasOrigin {
 			return fmt.Errorf("契约校验失败: 缺失核心审计字段 'origin'")
 		}
-
-		// 【高能模拟】：我们故意人为追加一条 strict 规则：必须包含 "user_id"
-		// 因为 httpbin.org 的 /get 接口绝对不会返回 user_id，这必然会触发我们的契约警报！
+		// 故意引发契约塌陷，导流至第三层 AI
 		if _, hasUser := rawData["user_id"]; !hasUser {
-			return fmt.Errorf("契约异常(Schema Drift): 缺失预期的关键业务字段 'user_id'")
+			return fmt.Errorf("契约异常: 缺失预期的关键业务字段 'user_id'")
 		}
 	}
-
 	return nil
 }
 func NewGatewayProxy(target string) *httputil.ReverseProxy {
@@ -84,28 +162,36 @@ func NewGatewayProxy(target string) *httputil.ReverseProxy {
 		}
 		resp.Body.Close()
 
-		// 🔍 【分层自愈架构升级】
 		// 🌟 第一层：状态码快路径检测
 		if fixedBody, matched := tryDeterministicHeal(resp.StatusCode, bodyBytes); matched {
-			log.Printf("[%s] 🛡️ [第一层：快路径自愈成功] 触发状态码本地规则，完成修正", traceID)
+			log.Printf("[%s] 🛡️ [第一层自愈成功] 触发状态码本地规则，完成静态重写", traceID)
 			bodyBytes = fixedBody
 			resp.StatusCode = http.StatusOK
 		} else if resp.StatusCode == http.StatusOK {
-			// 🌟 第二层：状态码为 200，进入契约 Schema 校验层
-			log.Printf("[%s] 🔍 [第二层：结构契约校验] 正在对路径 %s 的响应数据进行 Schema 校验...", traceID, currentPath)
+			// 🌟 第二层：进入契约 Schema 校验层
+			log.Printf("[%s] 🔍 [第二层契约校验] 正在对路径 %s 的响应数据进行 Schema 校验...", traceID, currentPath)
 
 			if schemaErr := checkSchemaContract(currentPath, bodyBytes); schemaErr != nil {
-				// 契约塌陷！拉响警报，准备将数据移交给第三层（AI 语义层）
 				log.Printf("[%s] 🚨 [契约校验失败！] 错误原因: %v", traceID, schemaErr)
-				log.Printf("[%s] 🤖 [准备降级至AI层] 200 OK 伪劣数据已被拦截，准备交由 AI 大模型进行语义修复与字段对齐...", traceID)
+				log.Printf("[%s] 🤖 [降级激活] 准备将请求交由第三层 AI 语义引擎进行全自动智能对齐...", traceID)
 
-				// 暂时给个占位数据，下一版在这里放 DeepSeek 强力修复逻辑
-				bodyBytes = []byte(fmt.Sprintf(`{"code": 50010, "message": "Schema契约塌陷 (%v)，等待 AI 语义自愈模块接管修复"}`, schemaErr.Error()))
+				// 🌟 第三层：终极大招——大模型智能自愈（设置 5 秒超时保护，防止拖垮微服务网关）
+				aiCtx, cancel := context.WithTimeout(resp.Request.Context(), 5*time.Second)
+				defer cancel()
+
+				aiHealedBody, aiErr := healWithAI(aiCtx, schemaErr.Error(), bodyBytes)
+				if aiErr != nil {
+					// 如果大模型层也挂了，网关启动最后的兜底悲观策略
+					log.Printf("[%s] ❌ [AI自愈遭遇挫败] 大模型调用失败: %v", traceID, aiErr)
+					bodyBytes = []byte(`{"code":50099,"error":"Gateway Panic","message":"网关分层自愈全部耗尽，数据彻底无法对齐"}`)
+				} else {
+					log.Printf("[%s] 🎉🎉🎉 [AI自愈神话诞生！] DeepSeek 成功修补数据契约，生成合法对齐响应！", traceID)
+					bodyBytes = aiHealedBody
+				}
 			} else {
 				log.Printf("[%s] ✅ [契约校验通过] 数据流完全符合生产标准，准予放行", traceID)
 			}
 		}
-
 		// 重新装流回填
 		resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		resp.ContentLength = int64(len(bodyBytes))
